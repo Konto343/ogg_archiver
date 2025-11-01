@@ -1,0 +1,6 @@
+yt-dlp
+termcolor
+requests
+pillow
+mutagen
+tqdm

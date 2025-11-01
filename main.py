@@ -1,0 +1,453 @@
+import yt_dlp
+from termcolor import cprint
+import json
+import os
+import time
+import requests
+from PIL import Image
+from mutagen import File
+from time import strftime, localtime
+from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor
+
+# settings
+refresh_cache_at_scan = False # force update ONLY PLAYLIST, CHANNEL cache
+update_metadata_existing = False # force update metadata from cache, if file already exists
+silent = True
+thread_pool = ThreadPoolExecutor(max_workers=1)
+dry_run = False
+
+# ratelimits (important!)
+sleep_downloading = (25, 32)
+sleep_info = (2, 5)
+
+# paths
+output_dir = 'D:/media/music/youtube'
+os.makedirs(output_dir, exist_ok=True)
+
+cache_dir = 'cache'
+os.makedirs(cache_dir, exist_ok=True)
+
+# vars
+archive = []
+
+class album_song():
+	def __init__(self):
+		self.title = None
+		self.index = 1
+		self.url = None
+		self.album_title = None
+		self.album_thumbnail = None
+		self.album_url = None # for re-caching if error
+		self.channel = None
+		self.id = None
+		self.year = None
+
+def strip_producers(input):
+	return input.replace(' - Topic','') \
+		.replace(' Official', '') \
+		.replace('Official', '') \
+		.replace('official', '')
+
+def clean_str(input):
+	input = input \
+		.lower() \
+		.replace('/','_') \
+		.replace('⧸','_') \
+		.replace(' - topic','') \
+		.replace(' official', '') \
+		.replace(' ', '_')
+	
+	if input[-1] == ' ':
+		input = input[:-1]
+
+	reserved = ['<', '>', ':', '"', '/', '\\', '|', '?', '*', '.']
+	for char in reserved:
+		if char in input:
+			input = input.replace(char, '')
+		
+	return input
+
+def add_archive(url):
+	archive.append(url)
+	with open('archive.txt', 'a+') as f:
+		f.write(f'{url}\n')
+	cprint(f'Archived: {url}', 'green')
+
+def crop_image_square(image_path):
+	img = Image.open(image_path)
+
+	width, height = img.size
+
+	if width == height:
+		return
+
+	new_size = min(width, height)
+
+	left = (width - new_size) / 2
+	top = (height - new_size) / 2
+	right = (width + new_size) / 2
+	bottom = (height + new_size) / 2
+
+	img_cropped = img.crop((left, top, right, bottom))
+	img_cropped.save(image_path)
+
+def get_info(url, force_update=False) -> dict | bool:
+	url_type = get_link_type(url)
+
+	if not url_type:
+		cprint(f'Invaild Url Type: {url}', 'red')
+		return False
+
+	if url_type == 'channel' and '@' in url:
+		id = url.split('@')[1].split('/')[0]
+	elif url_type == 'channel_alt':
+		id = url.split('/')[4]
+	else:
+		id = url.split('?')[-1].split('=')[-1]
+
+	sub_dir = os.path.join(cache_dir, url_type)
+	os.makedirs(sub_dir, exist_ok=True)
+	cache_path = os.path.join(sub_dir, id + '.json')
+
+	if os.path.exists(cache_path) and not force_update:
+		cache_file = open(cache_path, 'r').read()
+		info = json.loads(cache_file)
+		return info
+
+	if force_update:
+		cprint(f'Forcing update cache on: {url}', 'yellow')
+
+	print('Processing Info:', url)
+
+	try:
+		ydl_opts = {
+			'quiet' : silent,
+			'noprogress' : silent,
+
+			'sleep_interval' : sleep_info[0],
+			'max_sleep_interval' : sleep_info[1],
+
+			'extract_flat': True,
+			'force_generic_extractor': True,
+		}
+
+		with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+			info = ydl.extract_info(url, download=False)
+			json.dump(info, open(cache_path, 'w+')) # make cache
+			return info
+	except Exception as e:
+		cprint(f'Info error: {e}', 'red')
+		add_archive(url)
+		return False
+
+def get_link_type(url):
+	if 'youtube.com/@' in url:
+		return 'channel'
+	elif 'youtube.com/channel' in url:
+		return 'channel_alt'
+	elif 'youtube.com/playlist?list' in url:
+		return 'playlist'
+	elif 'youtube.com/watch?v=' in url:
+		return 'video'
+	
+	print('Bad entry! No type declared!', url)
+	return None
+
+def get_list(file):
+	return [line.strip() for line in open(file, 'r').readlines()]
+
+def download(url, file_path) -> bool:
+	if os.path.exists(file_path):
+		return True
+
+	try:
+		response = requests.get(url, stream=True)
+		response.raise_for_status()
+
+		with open(file_path, 'wb') as f:
+			for chunk in response.iter_content(1024):
+				f.write(chunk)
+		return True
+	except Exception as e:
+		cprint(f'Download Error => {e}','red')
+		return False
+
+def download_video(url, path) -> bool:
+	ydl_opts = {
+		'quiet' : silent,
+		'noprogress' : silent,
+		'no_warnings' : silent,
+
+		#'cookiefile' : 'cookies.txt',
+
+		'format': "bestaudio[ext=opus]/bestaudio/best",
+		'outtmpl': f'{path}.%(ext)s',
+
+		'sleep_interval' : sleep_downloading[0],
+		'max_sleep_interval' : sleep_downloading[1],
+
+		'final_ext': 'ogg',
+		'postprocessors': [{
+			'key': 'FFmpegVideoRemuxer',
+			'preferedformat': 'ogg',
+		}],
+	}
+
+	try:
+		with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+			ydl.download([url])
+			return True
+	except Exception as e:
+		cprint(f'Download error => {e}', 'red')
+		add_archive(url)
+		return False
+
+def add_metadata(file_path, song : album_song):
+	audio = File(file_path)
+
+	if not audio:
+		return
+
+	audio['TRACKNUMBER'] = str(song.index + 1)
+	audio['ARTIST'] = song.channel.replace(' - Topic', '').replace(' Official', '').replace('official', '').replace('Official','')
+	audio['ALBUM'] = song.album_title
+	audio['TITLE'] = song.title # for more reliable FULL title
+
+	if song.year != None:
+		audio['DATE'] = str(song.year)
+		
+	audio.save()
+
+def get_songs(url) -> [album_song]:
+	songs = []
+
+	link_type = get_link_type(url)
+	data = get_info(url, force_update=refresh_cache_at_scan)
+
+	if not data or not 'channel' in data:
+		cprint(f'No data on: {url}!', 'red')
+		return songs
+
+	# prep channel folder / download artist thumbnails
+	channel_dir = os.path.join(output_dir, clean_str(data['channel']))
+	os.makedirs(channel_dir, exist_ok=True)
+	for thumbnail in data['thumbnails']:
+		if thumbnail['id'] == "avatar_uncropped" or thumbnail['id'] == 'banner_uncropped':
+			thumbnail_type = "artist" if thumbnail['id'] == 'avatar_uncropped' else 'backdrop'
+			download_path = channel_dir + f'/{thumbnail_type}.jpg'
+			download(thumbnail['url'], download_path)
+
+	# phrase url and make songs (Albums)
+	
+	if link_type == 'channel':
+		# @channel/releases:
+		# 	playlists[name] -> videos[minimal]
+		if '/releases' in url:
+			for index, entry in enumerate(data['entries']):
+				if entry['url'] in archive:
+					continue
+
+				playlist = get_info(entry['url'], force_update=refresh_cache_at_scan)
+
+				if not playlist:
+					cprint('Playlist invaild!', 'red')
+					continue
+
+				first_video = playlist['entries'][0]['url']
+
+				if first_video in archive:
+					cprint('First video is archived!', 'red')
+					continue
+
+				# first_entry = get_info(first_video)
+
+				# if not first_entry:
+				# 	cprint('First entry is invaild!', 'red')
+				# 	continue
+
+				for playlist_index, video in enumerate(playlist['entries']): 
+					if video['url'] in archive:
+						cprint('Video is archived!', 'red')
+						continue
+
+					video_data = get_info(video['url'])
+
+					if not video_data:
+						cprint('Video bad data!', 'red')
+						continue
+
+					song = album_song()
+					song.title = video_data['title']
+					song.index = playlist_index
+					song.url = video['url']
+					song.album_title = video_data['album'] if 'album' in video_data else playlist['title']
+					song.album_thumbnail = playlist['thumbnails'][-2] # -2 for max res.
+					
+					# old, because album thumbnails fall back on first entry anyways, no need for local vaildation
+					# song.album_thumbnail = first_entry['thumbnails'][-2] # -2 for JPEG and not WEBP
+					song.album_url = entry['url']
+					song.channel = data['channel']
+					song.id = video_data['id']
+					song.year = video_data['release_year']
+					songs.append(song)
+
+		# @channel/videos:
+		# 	videos[minimal]
+		if '/videos' in url:
+			for index, entry in enumerate(data['entries']):
+				if entry['url'] in archive:
+					cprint('Video is archived!', 'red')
+					continue
+
+				video_data = get_info(entry['url'])
+
+				if not video_data:
+					cprint('Video bad data!', 'red')
+					continue
+	
+				song = album_song()
+				song.title = video_data['title']
+				song.index = index
+				song.url = entry['url']
+				song.album_title = video_data['album'] if 'album' in video_data else '_unknown'
+				song.album_thumbnail = video_data['thumbnails'][-2] # -2 for JPEG and not WEBP
+				song.album_url = entry['url']
+				song.channel = data['channel']
+				song.id = video_data['id']
+				song.year = video_data['upload_date'][:4]
+				songs.append(song)
+
+
+	# @topic channel:
+	# 	videos[minimal] OR playlists[videos[full]]
+	if link_type == 'channel_alt':
+		for index, entry in enumerate(data['entries']):
+			if entry['ie_key'] == 'YoutubeTab':
+				playlist = get_info(entry['url'])
+				for index, entry in enumerate(playlist['entries']):
+					if entry['url'] in archive:
+						cprint('Video is archived!', 'red')
+						continue
+
+					video_data = get_info(entry['url'])
+
+					if not video_data:
+						cprint('Video bad data!', 'red')
+						continue
+			
+					song = album_song()
+					song.title = video_data['title']
+					song.index = index
+					song.url = entry['url']
+					song.album_title = video_data['album'] if 'album' in video_data else '_unknown'
+					song.album_thumbnail = video_data['thumbnails'][-2] # -2 for JPEG and not WEBP
+					song.album_url = entry['url']
+					song.channel = data['channel']
+					song.id = video_data['id']
+					song.year = video_data['upload_date'][:4]
+					songs.append(song)
+
+			if entry['ie_key'] == 'Youtube':
+				if entry['url'] in archive:
+					cprint('Video is archived!', 'red')
+					continue
+
+				video_data = get_info(entry['url'])
+
+				if not video_data:
+					cprint('Video bad data!', 'red')
+					continue
+		
+				song = album_song()
+				song.title = video_data['title']
+				#song.index = index
+				# indexing is not reliable if the topic channel has a huge list of ONLY videos
+				song.url = entry['url']
+				song.album_title = video_data['album'] if 'album' in video_data else '_unknown'
+				song.album_thumbnail = video_data['thumbnails'][-2] # -2 for JPEG and not WEBP
+				song.album_url = entry['url']
+				song.channel = data['channel']
+				song.id = video_data['id']
+				song.year = video_data['upload_date'][:4]
+				songs.append(song)
+
+	cprint(f'Collected {len(songs)} songs', 'green')
+
+	return songs
+
+def download_song(song : album_song):
+	global archive, output_dir
+
+	if song.url in archive:
+		return
+
+	song.channel = strip_producers(song.channel)
+
+	song_channel = clean_str(song.channel)
+	song_album = clean_str(song.album_title)
+	song_title = clean_str(song.title)
+	song_id = song.id
+	song_url = song.url
+
+	song_dir = os.path.join(output_dir, song_channel, song_album)
+	song_path = os.path.join(song_dir, song_id + '.ogg')
+	song_path_noext = os.path.join(song_dir, song_id) # used for downloading the song without it's extension, dumb i know
+	song_cover = os.path.join(song_dir, 'cover.jpg')
+
+	os.makedirs(song_dir, exist_ok=True)
+
+	if dry_run:
+		return
+
+	try:
+		if not os.path.exists(song_path):
+			cprint(f'Downloading: [{song_channel}] {song_title}', 'light_green')
+			success = download_video(song_url, song_path_noext)
+
+			if success:
+				add_metadata(song_path, song)
+				cprint(f'Downloaded: [{song_channel}] {song_title}', 'green')
+		else:
+			cprint(f'Already Exists: [{song_channel}] {song_title}', 'yellow')
+			if update_metadata_existing:
+				add_metadata(song_path, song)
+
+		if not os.path.exists(song_cover):
+			if song.album_thumbnail != '':
+				success = download(song.album_thumbnail['url'], song_cover)
+
+				if success:
+					crop_image_square(song_cover)
+					return
+
+				new_data = get_info(song.album_url, force_update=True)
+				state = download(new_data['thumbnails'][-2]['url'], song_cover)
+
+				if state:
+					crop_image_square(song_cover)
+	except Exception as e:
+		cprint(e, 'red')
+
+def main():
+	global archive, output_dir
+
+	targets = get_list('list.txt')
+	archive.extend(get_list('archive.txt'))
+
+	# prep metadata and get songs
+	for target in targets:
+		if target == '':
+			continue
+
+		if target[0] == '#':
+			continue
+
+		cprint(f'Fetching songs on: {target}', 'cyan')
+		songs = get_songs(target)
+	
+		for song in songs:
+			download_song(song)
+
+if __name__ == '__main__':
+	main()
