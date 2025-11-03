@@ -18,8 +18,9 @@ thread_pool = ThreadPoolExecutor(max_workers=1)
 dry_run = False
 
 # ratelimits (important!)
-sleep_downloading = (25, 32)
+sleep_downloading = (60, 120, 3)
 sleep_info = (2, 5)
+download_rate_limit = 500000
 
 # paths
 output_dir = 'D:/media/music/youtube'
@@ -118,7 +119,7 @@ def get_info(url, force_update=False) -> dict | bool:
 	if force_update:
 		cprint(f'Forcing update cache on: {url}', 'yellow')
 
-	print('Processing Info:', url)
+	cprint(f'Processing Info: {url}', 'cyan')
 
 	try:
 		ydl_opts = {
@@ -181,9 +182,11 @@ def download_video(url, path) -> bool:
 
 		#'cookiefile' : 'cookies.txt',
 
-		'format': "bestaudio[ext=opus]/bestaudio/best",
+		'format': "bestaudio[ext=opus]/bestaudio",
 		'outtmpl': f'{path}.%(ext)s',
 
+		'ratelimit' : download_rate_limit,
+		'sleep_interval_requests' : sleep_downloading[2],
 		'sleep_interval' : sleep_downloading[0],
 		'max_sleep_interval' : sleep_downloading[1],
 
@@ -254,11 +257,11 @@ def get_songs(url) -> [album_song]:
 					cprint('Playlist invaild!', 'red')
 					continue
 
-				first_video = playlist['entries'][0]['url']
+				# first_video = playlist['entries'][0]['url']
 
-				if first_video in archive:
-					cprint('First video is archived!', 'red')
-					continue
+				# if first_video in archive:
+				# 	cprint(f'First video is archived => {first_video['title']}', 'red')
+				# 	continue
 
 				# first_entry = get_info(first_video)
 
@@ -268,7 +271,7 @@ def get_songs(url) -> [album_song]:
 
 				for playlist_index, video in enumerate(playlist['entries']): 
 					if video['url'] in archive:
-						cprint('Video is archived!', 'red')
+						cprint(f'Video is archived => {video['title']}', 'red')
 						continue
 
 					video_data = get_info(video['url'])
@@ -414,6 +417,8 @@ def download_song(song : album_song):
 				add_metadata(song_path, song)
 
 		if not os.path.exists(song_cover):
+			cprint('Cover is missing... downloading...', 'yellow')
+
 			if song.album_thumbnail != '':
 				success = download(song.album_thumbnail['url'], song_cover)
 
@@ -421,11 +426,19 @@ def download_song(song : album_song):
 					crop_image_square(song_cover)
 					return
 
+				cprint('Cover failed. Redownloading info...', 'yellow')
+
 				new_data = get_info(song.album_url, force_update=True)
-				state = download(new_data['thumbnails'][-2]['url'], song_cover)
+				new_thumbnail = new_data['thumbnails'][-2]['url']
+				state = download(new_thumbnail, song_cover)
 
 				if state:
+					cprint("Downloaded Album Cover!", 'green')
 					crop_image_square(song_cover)
+				else:
+					cprint('Album cover failed to download!', 'red')
+			else:
+				cprint("Album URL missing!", 'red')
 	except Exception as e:
 		cprint(e, 'red')
 
@@ -446,7 +459,8 @@ def main():
 		cprint(f'Fetching songs on: {target}', 'cyan')
 		songs = get_songs(target)
 	
-		for song in songs:
+		for index, song in enumerate(songs):
+			cprint(f'[{index+1}/{len(songs)}]', 'magenta')
 			download_song(song)
 
 if __name__ == '__main__':
