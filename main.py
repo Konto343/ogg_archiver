@@ -2,34 +2,27 @@ import yt_dlp
 from termcolor import cprint
 import json
 import os
-import time
 import requests
 from PIL import Image
 from mutagen import File
-from time import strftime, localtime
-from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor
+import db
 
 # settings
-refresh_cache_at_scan = False # force update ONLY PLAYLIST, CHANNEL cache
-update_metadata_existing = False # force update metadata from cache, if file already exists
+refresh_cache_at_scan = False # force update only PLAYLIST and CHANNEL cache
+update_metadata_existing = False # force update file metadata with cache, if file already exists
 silent = True
 thread_pool = ThreadPoolExecutor(max_workers=1)
 dry_run = False
 
 # ratelimits (important!)
 sleep_downloading = (60, 120, 3)
-sleep_info = (2, 5)
+sleep_info = (10, 20)
 download_rate_limit = 500000
 
-# paths
-output_dir = 'D:/media/music/youtube'
+# init
+output_dir = '/run/media/user/MAIN/media/music/youtube'
 os.makedirs(output_dir, exist_ok=True)
-
-cache_dir = 'cache'
-os.makedirs(cache_dir, exist_ok=True)
-
-# vars
 archive = []
 
 class album_song():
@@ -93,28 +86,30 @@ def crop_image_square(image_path):
 	img_cropped = img.crop((left, top, right, bottom))
 	img_cropped.save(image_path)
 
+def get_id(url):
+	if url_type == 'channel' and '@' in url:
+		return url.split('@')[1].split('/')[0]
+	elif url_type == 'channel_alt':
+		return url.split('/')[4]
+	else:
+		return url.split('?')[-1].split('=')[-1]
+
 def get_info(url, force_update=False) -> dict | bool:
 	url_type = get_link_type(url)
+	url_id = get_id(url)
 
 	if not url_type:
 		cprint(f'Invaild Url Type: {url}', 'red')
 		return False
 
-	if url_type == 'channel' and '@' in url:
-		id = url.split('@')[1].split('/')[0]
-	elif url_type == 'channel_alt':
-		id = url.split('/')[4]
-	else:
-		id = url.split('?')[-1].split('=')[-1]
+	if not url_type:
+		cprint(f'Invaild Url Id: {url}', 'red')
+		return False
 
-	sub_dir = os.path.join(cache_dir, url_type)
-	os.makedirs(sub_dir, exist_ok=True)
-	cache_path = os.path.join(sub_dir, id + '.json')
+	cache_entry = db.get_entry(url_type, url_id)
 
-	if os.path.exists(cache_path) and not force_update:
-		cache_file = open(cache_path, 'r').read()
-		info = json.loads(cache_file)
-		return info
+	if cache_entry and not force_update:
+		return json.loads(cache_entry[0])
 
 	if force_update:
 		cprint(f'Forcing update cache on: {url}', 'yellow')
@@ -125,6 +120,7 @@ def get_info(url, force_update=False) -> dict | bool:
 		ydl_opts = {
 			'quiet' : silent,
 			'noprogress' : silent,
+			'no_warnings' : silent,
 
 			'sleep_interval' : sleep_info[0],
 			'max_sleep_interval' : sleep_info[1],
@@ -135,7 +131,11 @@ def get_info(url, force_update=False) -> dict | bool:
 
 		with yt_dlp.YoutubeDL(ydl_opts) as ydl:
 			info = ydl.extract_info(url, download=False)
-			json.dump(info, open(cache_path, 'w+')) # make cache
+
+			if force_update:
+				db.update_entry(url_type, url_id, json.dumps(info))
+			else:
+				db.add_entry(url_type, url_id, json.dumps(info))
 			return info
 	except Exception as e:
 		cprint(f'Info error: {e}', 'red')
@@ -242,7 +242,6 @@ def get_songs(url) -> [album_song]:
 			download(thumbnail['url'], download_path)
 
 	# phrase url and make songs (Albums)
-	
 	if link_type == 'channel':
 		# @channel/releases:
 		# 	playlists[name] -> videos[minimal]
@@ -464,4 +463,5 @@ def main():
 			download_song(song)
 
 if __name__ == '__main__':
+	db.init()
 	main()
